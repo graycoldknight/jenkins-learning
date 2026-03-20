@@ -1,0 +1,35 @@
+ckend Architect(Create Step 1 project files)
+  ⎿  Done (9 tool uses · 13.1k tokens · 43s)
+  (ctrl+o to expand)
+
+● All files are in place. Here's what to do next:
+
+  Step 1 Execution
+
+  1. Start Jenkins
+  cd /home/raj/projects/articles/research/jenkins
+  make jenkins-up
+
+  2. Unlock Jenkins (wait ~30s for startup)
+  make jenkins-unlock
+  Copy the password, paste it at http://localhost:8080.
+
+  3. Complete the wizard
+  - Install suggested plugins
+  - Create your admin user
+
+  4. Create the Freestyle job (manual — in the UI)
+  - New Item → flask-api-build → Freestyle project
+  - Source Code Management → Git → point to this repo
+  - Build Steps → Execute shell:
+  echo "Hello from Jenkins"
+  python3 --version
+  pip install -r app/requirements.txt
+  cd app && pytest tests/ -v
+  - Build Triggers → Poll SCM → H/5 * * * *
+  - Save → Build Now
+
+  5. Check console output — you should see all 3 tests pass.
+
+  6. Break a test — edit app/tests/test_app.py, change {"result": 7} to {"result": 99}, push the commit, and watch the job go red.
+
