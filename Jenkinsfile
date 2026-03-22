@@ -1,10 +1,5 @@
 pipeline {
-    agent {
-        docker {
-            image 'python:3.11-slim'
-            args '-v /var/run/docker.sock:/var/run/docker.sock'
-        }
-    }
+    agent none
 
     environment {
         APP_NAME    = 'flask-api'
@@ -14,36 +9,65 @@ pipeline {
 
     stages {
         stage('Checkout') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                }
+            }
             steps {
                 checkout scm
+                stash includes: '**', name: 'source'
             }
         }
 
         stage('Install Dependencies') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                }
+            }
             steps {
+                unstash 'source'
                 sh 'pip install -r app/requirements.txt'
+                stash includes: '**', name: 'with-deps'
             }
         }
 
         stage('Lint') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                }
+            }
             steps {
+                unstash 'with-deps'
                 sh 'flake8 app/'
             }
         }
 
         stage('Test') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                }
+            }
             steps {
+                unstash 'with-deps'
                 sh 'pytest app/tests/ -v --junitxml=results.xml --cov=app --cov-report=html:coverage-report'
+                stash includes: 'results.xml,coverage-report/**', name: 'test-results'
             }
         }
 
         stage('Build Docker Image') {
+            agent any
             steps {
+                unstash 'source'
                 sh "docker build -t ${REGISTRY}/${APP_NAME}:${APP_VERSION} ./app"
             }
         }
 
         stage('Push Docker Image') {
+            agent any
             steps {
                 withCredentials([
                     usernamePassword(
@@ -63,8 +87,11 @@ pipeline {
 
     post {
         always {
-            junit 'results.xml'
-            archiveArtifacts artifacts: 'coverage-report/**', fingerprint: true
+            node('') {
+                unstash 'test-results'
+                junit 'results.xml'
+                archiveArtifacts artifacts: 'coverage-report/**', fingerprint: true
+            }
         }
         success {
             echo 'All stages passed!'
