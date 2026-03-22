@@ -1,0 +1,181 @@
+Files Created
+=============
+
+1. Jenkinsfile
+--------------
+
+This is the core of Step 2 — it moves your build definition from the Jenkins UI into code.
+
+    pipeline {
+        agent {
+            docker {
+                image 'python:3.11-slim'
+            }
+        }
+
+- pipeline {} — declares a Declarative Pipeline (vs. Scripted which uses node {})
+- agent { docker { image 'python:3.11-slim' } } — tells Jenkins to spin up a Docker
+  container from the python:3.11-slim image and run all stages inside it. This is why
+  Step 1 failed — the Jenkins controller doesn't have Python, but this container does.
+  Jenkins pulls the image, starts a container, mounts the workspace into it, runs your
+  stages, then destroys the container.
+
+  Why does this container have Python?
+  python:3.11-slim is a prebuilt Docker image from Docker Hub that comes with Python, pip,
+  and the standard library already installed. It's built specifically for running Python
+  apps. So when Jenkins starts a container from this image, commands like pip install and
+  pytest just work — because they're running inside a Python environment, not on the
+  Jenkins controller. In Step 1, the freestyle job ran commands directly on the Jenkins
+  controller, which is a Java-based image (jenkins/jenkins:lts) with no Python installed —
+  that's why it failed.
+
+        stages {
+            stage('Checkout') {
+                steps {
+                    checkout scm
+                }
+            }
+
+- checkout scm — clones the repo. scm refers to whatever SCM you configured in the job
+  (your GitHub repo). Jenkins handles the git clone, branch selection, and credentials
+  automatically.
+
+            stage('Install Dependencies') {
+                steps {
+                    sh 'pip install -r app/requirements.txt'
+                }
+            }
+
+- Runs pip install inside the Python container. This installs flask, pytest, flake8, and
+  pytest-cov. Since the container is fresh every build, this runs every time (no caching).
+
+            stage('Lint') {
+                steps {
+                    sh 'flake8 app/'
+                }
+            }
+
+- Runs flake8 against your app code. If any style violations are found, the sh step
+  returns a non-zero exit code, which marks the stage as failed.
+
+            stage('Test') {
+                steps {
+                    sh 'pytest app/tests/ -v --junitxml=results.xml'
+                }
+            }
+
+- Runs pytest with two flags:
+  - -v — verbose output (shows each test name)
+  - --junitxml=results.xml — writes test results in JUnit XML format, which Jenkins
+    can parse
+
+            post {
+                always {
+                    junit 'results.xml'
+                }
+                success {
+                    echo 'All stages passed!'
+                }
+                failure {
+                    echo 'Pipeline failed — check the stage that went red.'
+                }
+            }
+
+- post runs after all stages, regardless of pass/fail
+- always { junit 'results.xml' } — publishes the JUnit XML to Jenkins. This is what
+  creates the Test Result tab on each build, with per-test pass/fail and trend graphs
+  over time
+- success / failure — conditional blocks that run only on that outcome
+
+
+2. app/.flake8
+--------------
+
+    [flake8]
+    max-line-length = 120
+    exclude = __pycache__,.git
+
+Configures flake8 so it doesn't flag lines under 120 chars (default is 79, which is too
+strict for most projects) and skips generated directories.
+
+
+Files Modified
+==============
+
+3. Dockerfile.jenkins
+---------------------
+
+The base jenkins/jenkins:lts image has no Docker CLI. But our Jenkinsfile uses
+agent { docker { ... } }, which means Jenkins needs to run docker commands to spin up the
+Python container. So this Dockerfile:
+
+    FROM jenkins/jenkins:lts
+    USER root
+    RUN apt-get update && apt-get install -y docker.io && rm -rf /var/lib/apt/lists/*
+    COPY entrypoint.sh /entrypoint.sh
+    RUN chmod +x /entrypoint.sh
+    ENTRYPOINT ["/entrypoint.sh"]
+
+- Switches to root to install packages
+- Installs docker.io (the Docker CLI)
+- Copies a custom entrypoint script
+
+
+4. entrypoint.sh
+----------------
+
+    #!/bin/bash
+    if [ -S /var/run/docker.sock ]; then
+        chmod 666 /var/run/docker.sock
+    fi
+    exec /usr/bin/tini -- /usr/local/bin/jenkins.sh "$@"
+
+The docker-compose.yml mounts /var/run/docker.sock from your host into the container.
+This lets Jenkins talk to your host's Docker daemon (instead of running Docker-in-Docker).
+But the socket's ownership inside the container doesn't match the jenkins user, so it gets
+"permission denied." This script runs as root on every container start, fixes the socket
+permissions, then hands off to the normal Jenkins startup.
+
+
+5. docker-compose.yml
+---------------------
+
+    # Before:
+    image: jenkins/jenkins:lts
+
+    # After:
+    build:
+      context: .
+      dockerfile: Dockerfile.jenkins
+
+Changed from pulling the stock Jenkins image to building our custom image that includes
+Docker CLI.
+
+
+How It All Fits Together
+========================
+
+There are two separate Docker images at play:
+
+  a) Custom Jenkins image (Dockerfile.jenkins) — the Jenkins server itself, built from
+     jenkins/jenkins:lts with Docker CLI added. docker compose up builds and runs this.
+     It runs Jenkins (Java), manages your jobs, and serves the UI at localhost:8080.
+     This container is always running.
+
+  b) python:3.11-slim — pulled later, by Jenkins, when it runs your pipeline. Each time
+     you click Build Now, Jenkins spins up a temporary container from this image to
+     execute your stages (pip install, flake8, pytest), then destroys it.
+
+The flow:
+
+1. docker compose up builds the custom Jenkins image (a) and starts it
+2. The entrypoint fixes docker.sock permissions
+3. You create a Pipeline job pointing to your GitHub repo
+4. Jenkins reads the Jenkinsfile from the repo
+5. Jenkins runs docker pull python:3.11-slim (b) on your host's Docker daemon
+6. Jenkins starts a temporary Python container, mounts the workspace into it
+7. Each stage runs shell commands inside that container
+8. After all stages, Jenkins publishes JUnit results and cleans up the Python container
+
+The key insight: Jenkins itself doesn't need Python — it delegates to a disposable Docker
+container that has the right tools. This pattern scales to any language or toolchain.
