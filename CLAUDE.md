@@ -22,7 +22,7 @@ make test             # pytest app/tests/ -v
 make lint             # flake8 app/
 ```
 
-Run a single test:
+Run a single test (must `cd app` because tests import `from app import app`):
 ```bash
 cd app && pytest tests/test_app.py::test_health -v
 ```
