@@ -8,53 +8,38 @@ pipeline {
     }
 
     stages {
-        stage('Checkout') {
+        stage('Lint & Test') {
             agent {
                 docker {
                     image 'python:3.11-slim'
                 }
             }
-            steps {
-                checkout scm
-                stash includes: '**', name: 'source'
-            }
-        }
+            stages {
+                stage('Checkout') {
+                    steps {
+                        checkout scm
+                        stash includes: '**', name: 'source'
+                    }
+                }
 
-        stage('Install Dependencies') {
-            agent {
-                docker {
-                    image 'python:3.11-slim'
+                stage('Install Dependencies') {
+                    steps {
+                        sh 'pip install -r app/requirements.txt'
+                    }
                 }
-            }
-            steps {
-                unstash 'source'
-                sh 'pip install -r app/requirements.txt'
-                stash includes: '**', name: 'with-deps'
-            }
-        }
 
-        stage('Lint') {
-            agent {
-                docker {
-                    image 'python:3.11-slim'
+                stage('Lint') {
+                    steps {
+                        sh 'flake8 app/'
+                    }
                 }
-            }
-            steps {
-                unstash 'with-deps'
-                sh 'flake8 app/'
-            }
-        }
 
-        stage('Test') {
-            agent {
-                docker {
-                    image 'python:3.11-slim'
+                stage('Test') {
+                    steps {
+                        sh 'pytest app/tests/ -v --junitxml=results.xml --cov=app --cov-report=html:coverage-report'
+                        stash includes: 'results.xml,coverage-report/**', name: 'test-results'
+                    }
                 }
-            }
-            steps {
-                unstash 'with-deps'
-                sh 'pytest app/tests/ -v --junitxml=results.xml --cov=app --cov-report=html:coverage-report'
-                stash includes: 'results.xml,coverage-report/**', name: 'test-results'
             }
         }
 
