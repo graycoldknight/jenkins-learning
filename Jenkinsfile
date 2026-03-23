@@ -76,7 +76,10 @@ pipeline {
         }
 
         stage('Deploy to Staging') {
-            when { branch 'develop' }
+            when {
+                beforeAgent true
+                branch 'develop'
+            }
             agent any
             steps {
                 unstash 'source'
@@ -85,7 +88,10 @@ pipeline {
         }
 
         stage('Deploy to Production') {
-            when { branch 'main' }
+            when {
+                beforeAgent true
+                branch 'main'
+            }
             agent any
             steps {
                 input message: 'Deploy to production?', ok: 'Deploy'
