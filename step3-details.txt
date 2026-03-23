@@ -316,20 +316,200 @@ Key Concepts Introduced in Step 3
    your code changes (but requirements.txt stays the same).
 
 
-How It All Fits Together
-========================
+How It All Fits Together (mapped to Build #7 console output)
+==============================================================
 
-1. You click Build Now in Jenkins
+Each numbered step below corresponds to what you saw in the console output of build #7.
+
+
+1. You click Build Now
+   Console: "Started by user admin"
+   (line 1)
+
+
 2. Jenkins reads the Jenkinsfile from your repo
-3. Jenkins pulls python:3.11-slim and starts a container
-4. Inside that container: checkout code, pip install, run flake8, run pytest with coverage
-5. Test results and source code are stashed (saved to Jenkins' internal storage)
-6. The Python container is destroyed
-7. On the Jenkins controller: unstash source code, run docker build to create the app image
-8. Still on the controller: log in to Docker Hub using stored credentials, push the image
-9. In the post block: unstash test results, publish JUnit results, archive coverage report
-10. The image is now on Docker Hub at rajsambasivan/flask-api:<build-number>
+   Console: "Obtained Jenkinsfile from git https://github.com/graycoldknight/jenkins-learning.git"
+   (line 2)
+   Jenkins clones the repo FIRST just to read the Jenkinsfile. This is a lightweight
+   fetch — it only needs the pipeline definition to know what to do next.
+
+
+3. Jenkins checks if the python:3.11-slim image exists locally
+   Console: "docker inspect -f . python:3.11-slim"
+   (line 35)
+   docker inspect checks if the image is already cached on the host. The "." output means
+   it exists — no need to pull it again. If it wasn't cached, you'd see a docker pull here.
+
+
+4. Jenkins starts a Python container for the "Lint & Test" parent stage
+   Console: "docker run -t -d -u 0:0 -w /var/jenkins_home/workspace/flask-api-pipeline
+             --volumes-from 185763198f5f... python:3.11-slim cat"
+   (line 41)
+   Breaking down the docker run flags:
+   - -t -d — run in detached mode with a terminal (container stays alive in background)
+   - -u 0:0 — run as root (UID 0, GID 0) inside the container
+   - -w /var/jenkins_home/workspace/flask-api-pipeline — set the working directory
+   - --volumes-from 185763198f5f... — mount ALL volumes from the Jenkins container.
+     This is how the Python container sees the workspace — it shares the Jenkins
+     container's filesystem via volume mounts. The long hex string (185763198f5f...) is
+     the Jenkins container's ID.
+   - python:3.11-slim cat — start the container running "cat" (which just keeps it alive
+     waiting for input). Jenkins will exec commands into this running container for each
+     stage.
+
+   The container ID c8dbca34dc1f... is now running and waiting for commands.
+
+
+5. Checkout stage — clone the repo inside the Python container
+   Console: "git fetch ... https://github.com/graycoldknight/jenkins-learning.git"
+             "Checking out Revision 6b63fb3..."
+             "Stashed 41 file(s)"
+   (lines 46-65)
+   Jenkins runs git commands to checkout commit 6b63fb3 (the "nest Python stages" commit).
+   Then stash saves all 41 files to Jenkins' internal storage for later use by the Docker
+   build stage.
+
+   Note the warning on line 50: "special launcher ... will be ignored" — this means git
+   runs on the Jenkins controller, not inside the Python container. Git operations use the
+   controller's git binary because the Docker workflow plugin can't reliably run git inside
+   the container. This is fine — the files end up in the shared workspace either way.
+
+
+6. Install Dependencies — pip install inside the Python container
+   Console: "+ pip install -r app/requirements.txt"
+             "Collecting flask==3.1.0..."
+             "Successfully installed Jinja2-3.1.6 ... flask-3.1.0 ... pytest-8.3.5 ..."
+   (lines 70-137)
+   This runs INSIDE the Python container (c8dbca34dc1f). pip downloads and installs all
+   packages. The "+" prefix before each command is sh -x trace output — Jenkins runs
+   shell commands with tracing enabled so you can see exactly what executed.
+
+   The "WARNING: Running pip as root" is harmless — this container is disposable, so
+   there's no risk of breaking system packages.
+
+
+7. Lint stage — flake8 inside the same Python container
+   Console: "+ flake8 app/"
+   (line 143)
+   flake8 runs and produces no output — meaning zero lint violations. If there were
+   violations, you'd see them listed here and the stage would fail. This works because
+   pip installed flake8 in step 6, and we're in the SAME container.
+
+
+8. Test stage — pytest with coverage inside the same Python container
+   Console: "+ pytest app/tests/ -v --junitxml=results.xml --cov=app --cov-report=html:coverage-report"
+             "app/tests/test_app.py::test_health PASSED    [ 33%]"
+             "app/tests/test_app.py::test_greet PASSED      [ 66%]"
+             "app/tests/test_app.py::test_add PASSED        [100%]"
+             "Coverage HTML written to dir coverage-report"
+             "3 passed in 0.33s"
+             "Stashed 12 file(s)"
+   (lines 148-168)
+   pytest runs all 3 tests, writes JUnit XML to results.xml, and generates an HTML
+   coverage report in coverage-report/. Then stash saves 12 files (results.xml + the
+   HTML report files) under the name 'test-results' for the post block.
+
+
+9. Python container is destroyed
+   Console: "docker stop --time=1 c8dbca34dc1f..."
+             "docker rm -f --volumes c8dbca34dc1f..."
+   (lines 172-173)
+   Jenkins stops and removes the Python container. It served its purpose — lint and tests
+   are done. The stashed files survive because they're stored in Jenkins, not in the
+   container.
+
+
+10. Build Docker Image stage — runs on the Jenkins controller
+    Console: "Running on Jenkins in /var/jenkins_home/workspace/flask-api-pipeline"
+              "+ docker build -t docker.io/rajsambasivan/flask-api:7 ./app"
+    (lines 183-184, 207)
+    No "withDockerContainer" here — this runs directly on the Jenkins controller (which
+    has Docker CLI from our Dockerfile.jenkins). The unstash retrieves the source code,
+    then docker build creates the app image.
+
+    The build output shows Docker executing each Dockerfile instruction:
+    - #5 [1/5] FROM python:3.11-slim — uses cached base image (DONE 0.6s)
+    - #6 [2/5] WORKDIR /app — creates /app directory (DONE 0.1s)
+    - #7 [3/5] COPY requirements.txt — copies requirements file (DONE 0.2s)
+    - #8 [4/5] RUN pip install — installs dependencies (DONE 17.3s — the slow step)
+    - #9 [5/5] COPY . . — copies app code (DONE 0.3s)
+    - #10 naming to docker.io/rajsambasivan/flask-api:7 — tags the final image
+
+    Note: pip install happens TWICE in this pipeline — once in the Python container for
+    testing (step 6), and once in the Docker build for the deployable image (step 10).
+    These are two different contexts with two different purposes.
+
+
+11. Push Docker Image stage — docker login and push on the Jenkins controller
+    Console: "Masking supported pattern matches of $DOCKER_PASS"
+              "+ echo ****"
+              "+ docker login -u rajsambasivan --password-stdin"
+              "Login Succeeded"
+              "+ docker push docker.io/rajsambasivan/flask-api:7"
+    (lines 352-428)
+
+    First, notice line 352: "Masking supported pattern matches of $DOCKER_PASS" — Jenkins
+    is telling you it will replace any occurrence of your Docker Hub token with **** in the
+    output. This is withCredentials in action.
+
+    Line 355: "+ echo ****" — your actual token was piped to docker login, but Jenkins
+    masked it. The real command was: echo "<your-token>" | docker login -u rajsambasivan
+    --password-stdin
+
+    "Login Succeeded" — authenticated to Docker Hub.
+
+    Then docker push uploads the image layers:
+    - "Mounted from library/python" (lines 418-422) — Docker Hub recognizes that some
+      layers (the base python:3.11-slim layers) already exist in Docker Hub's storage,
+      so it doesn't upload them again. It just "mounts" (references) them. This saves
+      significant upload time and bandwidth.
+    - "Pushed" (lines 423-427) — these are YOUR layers (requirements install, app code)
+      that are unique to your image and need to be uploaded.
+    - "7: digest: sha256:34c4213a..." — the final image manifest is stored. The digest
+      is a content-addressable hash — anyone pulling this exact image gets this exact hash.
+
+
+12. Post block — publish results on the Jenkins controller
+    Console: "Running on Jenkins in /var/jenkins_home/workspace/flask-api-pipeline"
+              "[Pipeline] unstash"
+              "[Pipeline] junit"
+              "Recording test results"
+              "[Pipeline] archiveArtifacts"
+              "Archiving artifacts"
+              "Recording fingerprints"
+              "All stages passed!"
+    (lines 439-452)
+
+    node('') allocates the Jenkins controller. unstash retrieves the test results that
+    were saved back in step 8. junit parses results.xml and creates the Test Result tab
+    in the Jenkins UI. archiveArtifacts saves the coverage report as downloadable build
+    artifacts. fingerprints are checksums Jenkins uses to track artifact lineage.
+
+    Finally: "All stages passed!" — the success post condition fires.
+
+    "Finished: SUCCESS" (line 458) — build #7 is complete.
+
+
+Summary of Execution Environments in Build #7
+==============================================
+
+    Stages                  | Where they ran          | Container ID
+    ----------------------- | ----------------------- | ----------------
+    Checkout                | Python container         | c8dbca34dc1f
+    Install Dependencies    | Python container         | c8dbca34dc1f
+    Lint                    | Python container         | c8dbca34dc1f
+    Test                    | Python container         | c8dbca34dc1f
+    Build Docker Image      | Jenkins controller       | 185763198f5f (Jenkins itself)
+    Push Docker Image       | Jenkins controller       | 185763198f5f (Jenkins itself)
+    Post Actions            | Jenkins controller       | 185763198f5f (Jenkins itself)
+
+The Python container (c8dbca34dc1f) was created at line 41 and destroyed at lines 172-173.
+It lived for exactly the duration of the four Python stages. The Jenkins controller
+(185763198f5f) was running the entire time — it orchestrated everything.
 
 The pipeline went from "run tests" (Step 2) to "run tests AND produce a deployable
-artifact" (Step 3). The Docker image on Docker Hub is something you could deploy to any
-server with docker pull && docker run.
+artifact" (Step 3). The Docker image on Docker Hub at rajsambasivan/flask-api:7 is
+something you could deploy to any server with:
+
+    docker pull rajsambasivan/flask-api:7
+    docker run -p 5000:5000 rajsambasivan/flask-api:7
