@@ -112,6 +112,9 @@ pipeline {
                     } catch (e) {
                         echo "No test results to archive (tests may have been skipped)"
                     }
+                    // Save console log as artifact with branch name
+                    sh "curl -s ${env.BUILD_URL}consoleText > console-${env.BUILD_NUMBER}-${env.BRANCH_NAME}.txt"
+                    archiveArtifacts artifacts: "console-${env.BUILD_NUMBER}-${env.BRANCH_NAME}.txt"
                 }
             }
         }
