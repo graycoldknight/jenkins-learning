@@ -1,0 +1,289 @@
+Step 1: Install Jenkins & Run Your First Freestyle Job — Detailed Explanation
+==============================================================================
+
+
+What Step 1 Is About
+====================
+
+Step 1 is about getting Jenkins running, understanding its UI, and creating a Freestyle
+job. The build intentionally fails because the Jenkins container doesn't have Python — and
+that failure is the lesson. It motivates Step 2, where we fix this with Docker agents.
+
+
+Files Created
+=============
+
+1. app/app.py
+-------------
+
+    from flask import Flask, jsonify
+
+    app = Flask(__name__)
+
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "ok"})
+
+    @app.route('/greet/<name>')
+    def greet(name):
+        return jsonify({"message": f"Hello, {name}!"})
+
+    @app.route('/add/<int:a>/<int:b>')
+    def add(a, b):
+        return jsonify({"result": a + b})
+
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=5000)
+
+A minimal Flask web application with three endpoints. This app exists purely as something
+for Jenkins to build, test, and deploy — the app logic itself isn't the point.
+
+- Flask — a lightweight Python web framework. Flask(__name__) creates the app instance.
+- @app.route('/health') — a decorator that maps the URL /health to the health() function.
+  When someone hits http://localhost:5000/health, Flask calls this function.
+- jsonify() — converts a Python dictionary to a JSON HTTP response.
+- /health — returns {"status": "ok"}. Health endpoints are standard in production apps
+  so load balancers and monitoring tools can check if the app is alive.
+- /greet/<name> — Flask captures the URL segment as a variable. /greet/Jenkins returns
+  {"message": "Hello, Jenkins!"}. The f-string (f"Hello, {name}!") is Python's string
+  interpolation.
+- /add/<int:a>/<int:b> — the int: prefix tells Flask to convert the URL segments to
+  integers. /add/3/4 returns {"result": 7}. If you pass non-integers, Flask returns a
+  404 automatically.
+- app.run(host='0.0.0.0', port=5000) — starts the development server, listening on all
+  interfaces (0.0.0.0) at port 5000. Only runs when the file is executed directly
+  (not when imported).
+
+
+2. app/tests/test_app.py
+------------------------
+
+    import pytest
+    from app import app as flask_app
+
+    @pytest.fixture
+    def client():
+        flask_app.config['TESTING'] = True
+        with flask_app.test_client() as client:
+            yield client
+
+    def test_health(client):
+        response = client.get('/health')
+        assert response.status_code == 200
+        assert response.get_json() == {"status": "ok"}
+
+    def test_greet(client):
+        response = client.get('/greet/Jenkins')
+        assert response.status_code == 200
+        assert response.get_json() == {"message": "Hello, Jenkins!"}
+
+    def test_add(client):
+        response = client.get('/add/3/4')
+        assert response.status_code == 200
+        assert response.get_json() == {"result": 7}
+
+pytest tests for the three endpoints.
+
+- from app import app as flask_app — imports the Flask app object from app.py. This is
+  why tests must be run from the app/ directory (cd app && pytest) — Python needs to find
+  the app module.
+
+- @pytest.fixture — a fixture is a setup function that pytest calls before each test that
+  requests it. The client fixture creates a test client for making HTTP requests without
+  starting a real server.
+
+- flask_app.config['TESTING'] = True — enables Flask's testing mode, which gives better
+  error messages and disables error catching so exceptions propagate to the test.
+
+- flask_app.test_client() — creates a fake HTTP client. client.get('/health') simulates
+  a GET request to /health without needing a running server or network.
+
+- yield client — yield (instead of return) makes this a generator-based fixture. The test
+  runs between the yield and the end of the with block. After the test, the with block
+  cleans up the test client automatically.
+
+- Each test function takes client as a parameter — pytest sees this matches the fixture
+  name and injects it automatically (dependency injection).
+
+- assert — Python's built-in assertion. If the condition is False, the test fails.
+  response.status_code == 200 checks the HTTP status, response.get_json() parses the
+  JSON body for comparison.
+
+
+3. app/requirements.txt
+-----------------------
+
+    flask==3.1.0
+    pytest==8.3.5
+    flake8==7.2.0
+    pytest-cov==6.1.0
+
+Pinned Python dependencies:
+- flask — the web framework for the app
+- pytest — the test runner
+- flake8 — a Python linter that checks code style (PEP 8 compliance, unused imports, etc.)
+- pytest-cov — a pytest plugin that measures code coverage (used in Step 3)
+
+Versions are pinned (==) so builds are reproducible. Without pinning, pip install flask
+could install different versions on different days, leading to "it worked yesterday" bugs.
+
+
+4. docker-compose.yml
+---------------------
+
+    services:
+      jenkins:
+        image: jenkins/jenkins:lts
+        container_name: jenkins
+        ports:
+          - "8080:8080"
+          - "50000:50000"
+        volumes:
+          - jenkins_home:/var/jenkins_home
+          - /var/run/docker.sock:/var/run/docker.sock
+        restart: unless-stopped
+
+    volumes:
+      jenkins_home:
+
+Docker Compose defines how to run Jenkins as a container.
+
+- image: jenkins/jenkins:lts — the official Jenkins Long-Term Support image. LTS gets
+  stable updates every 12 weeks, vs. the weekly release which changes more often.
+
+- container_name: jenkins — gives the container a fixed name so you can reference it with
+  docker exec jenkins ... instead of a random hex ID.
+
+- ports:
+  - 8080:8080 — maps host port 8080 to container port 8080. This is the Jenkins web UI.
+    The format is host:container.
+  - 50000:50000 — the JNLP agent port. When you add separate build agents (separate
+    machines that run builds), they connect to the controller on this port. Not used in
+    Step 1, but included for later steps.
+
+- volumes:
+  - jenkins_home:/var/jenkins_home — a Docker named volume that persists Jenkins' data
+    (jobs, builds, plugins, credentials, configuration). Without this, everything would
+    be lost when the container restarts. The data lives in Docker's storage on your host,
+    not inside the container.
+  - /var/run/docker.sock:/var/run/docker.sock — mounts the host's Docker socket into the
+    container. This lets Jenkins run Docker commands (docker build, docker run) using the
+    HOST's Docker daemon. This is called "Docker-out-of-Docker" (DooD) — the container
+    doesn't run its own Docker daemon, it talks to the host's. Required for Steps 2-5
+    where Jenkins runs builds inside Docker containers.
+
+- restart: unless-stopped — Docker automatically restarts the container if it crashes or
+  if Docker Desktop restarts, unless you explicitly stopped it with docker compose down.
+
+- volumes: jenkins_home: — declares the named volume. Docker manages its storage location.
+
+
+5. Makefile
+-----------
+
+    jenkins-up:      docker compose up -d
+    jenkins-down:    docker compose down
+    jenkins-logs:    docker compose logs -f jenkins
+    jenkins-unlock:  docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+    test:            cd app && pytest tests/ -v
+    lint:            cd app && flake8 .
+
+Convenience shortcuts so you don't have to remember the full Docker commands.
+
+- make jenkins-up — starts Jenkins in detached mode (-d means run in background)
+- make jenkins-down — stops and removes the container (but jenkins_home volume persists)
+- make jenkins-logs — streams Jenkins logs in real-time (-f = follow)
+- make jenkins-unlock — prints the initial admin password from inside the container.
+  Jenkins generates this on first boot and stores it at a known path.
+- make test — runs pytest from the app/ directory with verbose output (-v shows each test)
+- make lint — runs flake8 from the app/ directory
+
+
+What We Did in the Jenkins UI
+=============================
+
+1. Setup Wizard
+   On first boot, Jenkins generates a random password and locks itself behind a setup
+   wizard. You paste the initial admin password to prove you have access to the server.
+   Then you install "suggested plugins" — a curated set including Git, Pipeline, and
+   other essentials. Finally you create an admin user.
+
+2. Freestyle Project (flask-api-build)
+   A Freestyle project is the simplest Jenkins job type. Everything is configured through
+   the UI — there's no code file defining the build. You specify:
+   - Where to get the code (Git repo URL)
+   - What to run (shell commands)
+   - When to run (manually, on schedule, on code changes)
+
+   The build steps we configured:
+       echo "Hello from Jenkins"
+       python3 --version
+       pip install -r requirements.txt
+       pytest app/tests/
+
+   This FAILED because the jenkins/jenkins:lts container is based on Debian with Java
+   installed — it has no Python, pip, or pytest. The commands ran directly on the Jenkins
+   controller, which doesn't have the right tools.
+
+   This is the key lesson: Freestyle jobs run on whatever machine Jenkins is running on.
+   If that machine doesn't have your language/tools installed, the build fails. Step 2
+   solves this with Docker agents — disposable containers that have the right tools.
+
+3. Poll SCM
+   Schedule: H/5 * * * * — tells Jenkins to check the Git repo for new commits every
+   5 minutes. If there are new commits, Jenkins triggers a build automatically.
+
+   H/5 vs */5: both mean "every 5 minutes" but H (hash) spreads the load. If you have
+   100 jobs all set to */5, they ALL poll at exactly :00, :05, :10, etc. H/5 uses a hash
+   of the job name to offset the schedule, so jobs poll at different times within each
+   5-minute window. This prevents thundering herd problems on the Git server.
+
+
+Key Concepts
+============
+
+Jenkins Architecture
+  - Controller — the Jenkins server process. Runs the web UI, stores configuration,
+    schedules jobs, and manages agents. This is what runs inside your Docker container.
+  - Agent/Node — a machine (or container) that executes builds. The controller can act as
+    its own agent (which is what happens in Step 1), or you can add separate agents.
+  - Executor — a slot on an agent that can run one build at a time. By default, the
+    controller has 2 executors, meaning it can run 2 builds simultaneously.
+  - Workspace — a directory on the agent where Jenkins checks out the repo and runs the
+    build. Each job gets its own workspace. Path is typically:
+    /var/jenkins_home/workspace/<job-name>/
+
+Freestyle vs Pipeline Jobs
+  - Freestyle: configured entirely in the UI. Simple but fragile — the configuration
+    isn't version-controlled, can't be code-reviewed, and is lost if Jenkins data is
+    destroyed.
+  - Pipeline: defined in a Jenkinsfile checked into the repo. Version-controlled,
+    reviewable, portable. This is what Step 2 introduces.
+
+Console Output
+  Jenkins logs everything a build does to the console output: git clone commands, shell
+  output, exit codes, timing. This is your primary debugging tool. When a build fails,
+  the console output tells you exactly which command failed and why.
+
+Plugin Ecosystem
+  Almost everything in Jenkins is a plugin — Git support, Pipeline support, Docker
+  support, JUnit test reporting, credential management. The "suggested plugins" installed
+  during setup cover the basics. Step 2 required installing the Docker Pipeline plugin
+  separately because it's not in the default set.
+
+
+Why Step 1 Matters
+==================
+
+Step 1 seems simple — install Jenkins, click some buttons, watch a build fail. But it
+establishes the fundamentals:
+
+1. You understand what Jenkins IS: a job scheduler with a web UI that runs commands on
+   machines.
+2. You've seen the console output, which is how you debug every future pipeline.
+3. You experienced the limitation of Freestyle jobs: they run on the controller, they're
+   not in code, and they break when tools aren't installed.
+4. You understand why Docker agents (Step 2) and Pipeline-as-code (Step 2) exist — they
+   solve the exact problems you just hit.
+
+The build failure wasn't a mistake — it was the point.

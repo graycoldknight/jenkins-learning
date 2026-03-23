@@ -1,0 +1,335 @@
+Step 3: Docker Agent, Credentials & Artifacts — Detailed Explanation
+=====================================================================
+
+
+What Changed from Step 2
+========================
+
+In Step 2, the entire pipeline ran inside a single python:3.11-slim container. That
+worked for linting and testing, but Step 3 adds two new stages: Build Docker Image and
+Push Docker Image. These stages need to run the docker command — which doesn't exist
+inside the Python container.
+
+The solution: split the pipeline into two execution contexts:
+
+  - Python stages (checkout, install, lint, test) run inside a python:3.11-slim container
+  - Docker stages (build, push) run on the Jenkins controller, which has Docker CLI
+    installed (from the Dockerfile.jenkins we set up in Step 2)
+
+This required restructuring the Jenkinsfile from a single global agent to per-stage agents.
+
+
+Files Created
+=============
+
+1. app/Dockerfile
+-----------------
+
+    FROM python:3.11-slim
+    WORKDIR /app
+    COPY requirements.txt .
+    RUN pip install --no-cache-dir -r requirements.txt
+    COPY . .
+    EXPOSE 5000
+    CMD ["python", "app.py"]
+
+This is the Docker image for YOUR Flask app — not the Jenkins build environment. It's what
+gets built and pushed to Docker Hub so you (or anyone) can run your app with:
+
+    docker run -p 5000:5000 rajsambasivan/flask-api:1
+
+Line by line:
+- FROM python:3.11-slim — start from the same Python base image
+- WORKDIR /app — set the working directory inside the container
+- COPY requirements.txt . — copy just the requirements file first
+- RUN pip install --no-cache-dir -r requirements.txt — install dependencies. This is done
+  before copying the rest of the code so Docker can cache this layer. If your code changes
+  but requirements.txt doesn't, Docker skips the pip install on rebuild (layer caching).
+- COPY . . — copy the rest of the app code
+- EXPOSE 5000 — document that the app listens on port 5000 (informational, doesn't
+  actually open the port)
+- CMD ["python", "app.py"] — default command when the container starts
+
+
+2. app/.coveragerc
+------------------
+
+    [run]
+    source = app
+    omit = tests/*
+
+    [report]
+    show_missing = true
+
+Configures pytest-cov (the coverage tool):
+- source = app — only measure coverage for the app module, not third-party packages
+- omit = tests/* — don't count the test files themselves in coverage metrics
+- show_missing = true — in the report, show which specific line numbers lack coverage
+
+
+Files Modified
+==============
+
+3. Jenkinsfile
+--------------
+
+This is the big change. Let's walk through each section.
+
+
+    pipeline {
+        agent none
+        ...
+    }
+
+In Step 2 we had agent { docker { image 'python:3.11-slim' } } at the top level, meaning
+every stage ran in a Python container. Now we use agent none at the top level, which means
+"don't assign a default agent — each stage will declare its own." This is needed because
+different stages need different execution environments.
+
+
+    environment {
+        APP_NAME    = 'flask-api'
+        APP_VERSION = "${env.BUILD_NUMBER}"
+        REGISTRY    = 'docker.io/rajsambasivan'
+    }
+
+The environment block defines variables available to ALL stages:
+- APP_NAME — the name of your Docker image
+- APP_VERSION — uses Jenkins' built-in BUILD_NUMBER (auto-increments: 1, 2, 3...)
+  so each build produces a uniquely tagged image (flask-api:1, flask-api:2, etc.)
+- REGISTRY — your Docker Hub registry path
+
+Together these produce image tags like: docker.io/rajsambasivan/flask-api:7
+
+
+    stage('Lint & Test') {
+        agent {
+            docker {
+                image 'python:3.11-slim'
+            }
+        }
+        stages {
+            stage('Checkout') { ... }
+            stage('Install Dependencies') { ... }
+            stage('Lint') { ... }
+            stage('Test') { ... }
+        }
+    }
+
+This is a "parent stage" that wraps four child stages. The key insight: all four child
+stages share the SAME Docker container because the agent is declared on the parent. This
+is why pip install in the Install stage makes flake8 and pytest available in later stages —
+they're all running in the same container.
+
+We tried putting each stage in its own docker agent first, but that failed because each
+agent spins up a FRESH container — pip install in one container doesn't carry over to
+the next.
+
+
+    stage('Checkout') {
+        steps {
+            checkout scm
+            stash includes: '**', name: 'source'
+        }
+    }
+
+checkout scm clones the repo (same as Step 2). The new part is stash:
+
+stash — saves a snapshot of files from the current workspace so other agents can retrieve
+them later. Here we stash everything (**) under the name 'source'. This is needed because
+the Docker build stage runs on a DIFFERENT agent (the Jenkins controller), which has a
+different workspace directory. Without stash/unstash, the controller wouldn't have the
+source code.
+
+Think of stash like a temporary zip file stored in Jenkins' memory that any agent can
+download.
+
+
+    stage('Install Dependencies') {
+        steps {
+            sh 'pip install -r app/requirements.txt'
+        }
+    }
+
+Same as Step 2 — installs flask, pytest, flake8, pytest-cov into the Python container.
+
+
+    stage('Lint') {
+        steps {
+            sh 'flake8 app/'
+        }
+    }
+
+Same as Step 2. Works because we're in the same container where pip install ran.
+
+
+    stage('Test') {
+        steps {
+            sh 'pytest app/tests/ -v --junitxml=results.xml --cov=app --cov-report=html:coverage-report'
+            stash includes: 'results.xml,coverage-report/**', name: 'test-results'
+        }
+    }
+
+Two new flags compared to Step 2:
+- --cov=app — enables coverage measurement for the app module
+- --cov-report=html:coverage-report — generates an HTML coverage report in a
+  coverage-report/ directory
+
+The stash saves the test results and coverage report so the post block (which runs on
+a different agent) can publish them.
+
+
+    stage('Build Docker Image') {
+        agent any
+        steps {
+            unstash 'source'
+            sh "docker build -t ${REGISTRY}/${APP_NAME}:${APP_VERSION} ./app"
+        }
+    }
+
+agent any — runs on the Jenkins controller (the only available "any" node), which has
+Docker CLI installed.
+
+unstash 'source' — retrieves the source code snapshot that was stashed during Checkout.
+
+docker build — builds a Docker image from app/Dockerfile and tags it. For build #7, the
+tag would be: docker.io/rajsambasivan/flask-api:7
+
+Note the double quotes around the sh string — this is Groovy string interpolation, which
+replaces ${REGISTRY}, ${APP_NAME}, and ${APP_VERSION} with their values BEFORE passing
+the command to the shell. Single quotes would pass the variables literally (no
+substitution).
+
+
+    stage('Push Docker Image') {
+        agent any
+        steps {
+            withCredentials([
+                usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )
+            ]) {
+                sh '''
+                    echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    docker push ${REGISTRY}/${APP_NAME}:${APP_VERSION}
+                '''
+            }
+        }
+    }
+
+This is the credentials stage — the core new concept in Step 3.
+
+withCredentials — retrieves the credential you stored in Jenkins (ID: dockerhub-creds)
+and injects it as environment variables (DOCKER_USER and DOCKER_PASS) ONLY within this
+block. Outside the block, these variables don't exist.
+
+Security features:
+- The password is MASKED in console output — Jenkins replaces it with ****
+- The variables only exist for the duration of the withCredentials block
+- The actual secret is stored encrypted in Jenkins, not in the Jenkinsfile
+- Anyone reading the Jenkinsfile sees 'dockerhub-creds' (the ID), never the actual token
+
+The sh block:
+- docker login — authenticates to Docker Hub using the injected credentials
+  --password-stdin reads the password from stdin (piped via echo) instead of the command
+  line, which is more secure (command line args are visible in process listings)
+- docker push — uploads the built image to Docker Hub
+
+Note the triple single quotes ('''): this is a Groovy multi-line string WITHOUT
+interpolation. The $DOCKER_USER and $DOCKER_PASS are resolved by the SHELL (bash), not
+Groovy. But ${REGISTRY}, ${APP_NAME}, ${APP_VERSION} are Jenkins environment variables,
+which the shell also resolves. If we used double quotes, Groovy would try to interpolate
+$DOCKER_PASS and fail because it's not a Groovy variable.
+
+
+    post {
+        always {
+            node('') {
+                unstash 'test-results'
+                junit 'results.xml'
+                archiveArtifacts artifacts: 'coverage-report/**', fingerprint: true
+            }
+        }
+        success {
+            echo 'All stages passed!'
+        }
+        failure {
+            echo 'Pipeline failed — check the stage that went red.'
+        }
+    }
+
+The post block changed from Step 2 in two ways:
+
+node('') — because we used agent none at the top level, there's no agent available for
+the post block. node('') explicitly allocates the Jenkins controller to run these steps.
+
+unstash 'test-results' — retrieves the JUnit XML and coverage report that were stashed
+during the Test stage (which ran in a different agent/container).
+
+archiveArtifacts — NEW in Step 3. This saves the coverage HTML report as a build artifact
+in Jenkins. Artifacts:
+- Persist after the build finishes (unlike workspace files which get cleaned up)
+- Are downloadable from the Jenkins build page
+- fingerprint: true tells Jenkins to compute checksums so it can track which build
+  produced which artifact
+
+
+Key Concepts Introduced in Step 3
+==================================
+
+1. Per-Stage Agents
+   Different stages can run in different environments. Python stages run in a container,
+   Docker stages run on the controller. This is a common pattern: use lightweight
+   containers for language-specific work, use the controller (or a dedicated agent) for
+   infrastructure tasks like Docker builds.
+
+2. stash/unstash
+   Transfers files between agents. Think of it as Jenkins' internal file sharing mechanism.
+   stash saves files from one agent's workspace, unstash retrieves them in another agent's
+   workspace. Limited to small/medium files — for large files, use external storage or
+   archiveArtifacts.
+
+3. Credentials Management
+   Secrets are stored encrypted in Jenkins and injected at runtime via withCredentials.
+   They NEVER appear in the Jenkinsfile, console output, or build logs. This is how
+   production CI/CD systems handle secrets — you store them once in Jenkins (or a vault),
+   and pipelines reference them by ID.
+
+4. Environment Variables
+   The environment block defines variables globally. Jenkins also provides built-in
+   variables like BUILD_NUMBER, JOB_NAME, WORKSPACE, etc. Using BUILD_NUMBER as the
+   image tag ensures every build produces a unique, traceable Docker image.
+
+5. Build Artifacts
+   archiveArtifacts saves files beyond the build's lifetime. Unlike the workspace (which
+   is temporary), artifacts are accessible from the Jenkins UI forever (until manually
+   deleted). Common artifacts: test reports, coverage reports, compiled binaries, Docker
+   image manifests.
+
+6. Docker Image Layer Caching
+   In app/Dockerfile, we COPY requirements.txt before COPY . . This is intentional.
+   Docker builds images in layers, and each instruction creates a layer. If a layer's
+   inputs haven't changed, Docker reuses the cached layer. By copying requirements.txt
+   first and running pip install, Docker can skip the slow pip install step when only
+   your code changes (but requirements.txt stays the same).
+
+
+How It All Fits Together
+========================
+
+1. You click Build Now in Jenkins
+2. Jenkins reads the Jenkinsfile from your repo
+3. Jenkins pulls python:3.11-slim and starts a container
+4. Inside that container: checkout code, pip install, run flake8, run pytest with coverage
+5. Test results and source code are stashed (saved to Jenkins' internal storage)
+6. The Python container is destroyed
+7. On the Jenkins controller: unstash source code, run docker build to create the app image
+8. Still on the controller: log in to Docker Hub using stored credentials, push the image
+9. In the post block: unstash test results, publish JUnit results, archive coverage report
+10. The image is now on Docker Hub at rajsambasivan/flask-api:<build-number>
+
+The pipeline went from "run tests" (Step 2) to "run tests AND produce a deployable
+artifact" (Step 3). The Docker image on Docker Hub is something you could deploy to any
+server with docker pull && docker run.
