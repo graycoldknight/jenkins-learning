@@ -29,23 +29,21 @@ cd app && pytest tests/test_app.py::test_health -v
 
 ## Architecture
 
-```
-jenkins/
-  app/                  # Flask API (the thing Jenkins builds/tests/deploys)
-    app.py              # Three endpoints: /health, /greet/<name>, /add/<a>/<b>
-    tests/              # pytest tests using Flask test_client fixture
-    requirements.txt    # Pinned deps: flask, pytest, flake8, pytest-cov
-  docker-compose.yml    # Runs Jenkins LTS; mounts docker.sock for Docker-in-Docker
-  Makefile              # Shortcuts for Jenkins and app commands
-  .plan/                # Step-by-step learning plan (overview.md + 5 step files)
-```
+The pipeline flow: Git push → Jenkins detects change → Lint → Test (Python Docker agent) → Build Docker image → Push to Docker Hub → Deploy (staging or production).
 
-**docker.sock mount:** `docker-compose.yml` mounts `/var/run/docker.sock` into the Jenkins container so that pipeline stages can run `docker build`/`docker push` against the host daemon. This is required for Steps 3–5.
-
-**Steps 3–5 add files not yet present:** `Dockerfile`, `.flake8`, `Jenkinsfile`, `deploy.sh`, and `jenkins-shared-library/` will be created as each step is executed.
+Key architectural decisions:
+- **`agent none` at top level** with per-stage agents. Lint/Test stages nest inside a single `docker { image 'python:3.11-slim' }` agent. Build/Push/Deploy stages use `agent any` (the Jenkins controller, which has docker.sock access).
+- **`stash`/`unstash`** passes workspace contents between agents since each agent gets a fresh workspace.
+- **docker.sock mount** (`docker-compose.yml`) lets Jenkins run `docker build`/`docker push` against the host daemon. `Dockerfile.jenkins` + `entrypoint.sh` fix socket permissions at container startup.
+- **Conditional deployment:** `when { branch 'develop' }` deploys to staging automatically; `when { branch 'main' }` requires manual `input` approval before production deploy.
+- **Staging** runs on port 5001, **production** on port 5000 (see `docker-compose.staging.yml` / `docker-compose.prod.yml`).
 
 ## Jenkins UI
 
 Jenkins runs at `http://localhost:8080`. Port 50000 is the JNLP agent port (used when adding separate build agents).
 
 The `jenkins_home` Docker volume persists all Jenkins configuration, jobs, credentials, and build history across container restarts.
+
+## Credentials
+
+Docker Hub credentials are stored in Jenkins as `dockerhub-creds` (username/password type), referenced in the Jenkinsfile via `withCredentials`.

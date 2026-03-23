@@ -7,6 +7,11 @@ pipeline {
         REGISTRY    = 'docker.io/rajsambasivan'
     }
 
+    parameters {
+        choice(name: 'DEPLOY_TARGET', choices: ['staging', 'production'], description: 'Deployment target')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip test stage')
+    }
+
     stages {
         stage('Lint & Test') {
             agent {
@@ -35,6 +40,7 @@ pipeline {
                 }
 
                 stage('Test') {
+                    when { expression { !params.SKIP_TESTS } }
                     steps {
                         sh 'pytest app/tests/ -v --junitxml=results.xml --cov=app --cov-report=html:coverage-report'
                         stash includes: 'results.xml,coverage-report/**', name: 'test-results'
@@ -68,14 +74,39 @@ pipeline {
                 }
             }
         }
+
+        stage('Deploy to Staging') {
+            when { branch 'develop' }
+            agent any
+            steps {
+                unstash 'source'
+                sh './deploy.sh staging'
+            }
+        }
+
+        stage('Deploy to Production') {
+            when { branch 'main' }
+            agent any
+            steps {
+                input message: 'Deploy to production?', ok: 'Deploy'
+                unstash 'source'
+                sh './deploy.sh production'
+            }
+        }
     }
 
     post {
         always {
             node('') {
-                unstash 'test-results'
-                junit 'results.xml'
-                archiveArtifacts artifacts: 'coverage-report/**', fingerprint: true
+                script {
+                    try {
+                        unstash 'test-results'
+                        junit 'results.xml'
+                        archiveArtifacts artifacts: 'coverage-report/**', fingerprint: true
+                    } catch (e) {
+                        echo "No test results to archive (tests may have been skipped)"
+                    }
+                }
             }
         }
         success {
@@ -83,6 +114,12 @@ pipeline {
         }
         failure {
             echo 'Pipeline failed — check the stage that went red.'
+            // Uncomment after configuring Extended E-mail in Jenkins:
+            // emailext(
+            //     subject: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+            //     body: "Check: ${env.BUILD_URL}",
+            //     to: 'you@example.com'
+            // )
         }
     }
 }

@@ -1,0 +1,9 @@
+services:
+  flask-api-staging:
+    image: docker.io/rajsambasivan/flask-api:latest
+    container_name: flask-api-staging
+    ports:
+      - "5001:5000"
+    environment:
+      - FLASK_ENV=staging
+    restart: unless-stopped
