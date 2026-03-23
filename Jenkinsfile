@@ -113,7 +113,9 @@ pipeline {
                         echo "No test results to archive (tests may have been skipped)"
                     }
                     // Save console log as artifact with branch name
-                    sh "curl -s ${env.BUILD_URL}consoleText > console-${env.BUILD_NUMBER}-${env.BRANCH_NAME}.txt"
+                    withCredentials([usernamePassword(credentialsId: 'jenkins-api-token', usernameVariable: 'JUSER', passwordVariable: 'JTOKEN')]) {
+                        sh "curl -s -u \$JUSER:\$JTOKEN ${env.BUILD_URL}consoleText > console-${env.BUILD_NUMBER}-${env.BRANCH_NAME}.txt"
+                    }
                     archiveArtifacts artifacts: "console-${env.BUILD_NUMBER}-${env.BRANCH_NAME}.txt"
                 }
             }
